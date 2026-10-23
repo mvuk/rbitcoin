@@ -537,6 +537,189 @@ fn dust_and_op_true_allowed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn ver_tx(inputs: &[OutPoint], version: i32, outputs: Vec<TxOut>) -> Transaction {
+    Transaction {
+        version: Version::non_standard(version),
+        lock_time: LockTime::ZERO,
+        input: inputs
+            .iter()
+            .copied()
+            .map(|previous_output| TxIn {
+                previous_output,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: outputs,
+    }
+}
+
+fn pay(value: u64) -> TxOut {
+    TxOut {
+        value: Amount::from_sat(value),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    }
+}
+
+fn truc_return_pad(n: usize) -> TxOut {
+    let mut script = vec![0x6a];
+    script.resize(1 + n, 0);
+    TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(script),
+    }
+}
+
+#[test]
+fn truc_topology_and_sizes() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(&[500_000, 500_000, 500_000]);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+
+    let confirmed = ver_tx(&[ops[0]], 3, vec![pay(490_000)]);
+    mp.accept_tx(&confirmed, &utxos, TIP_OK)
+        .expect("version 3 spending a confirmed output");
+
+    let v2_parent = ver_tx(&[ops[1]], 2, vec![pay(200_000), pay(200_000)]);
+    mp.accept_tx(&v2_parent, &utxos, TIP_OK).unwrap();
+    let onto_v2 = ver_tx(
+        &[OutPoint {
+            txid: v2_parent.compute_txid(),
+            vout: 0,
+        }],
+        3,
+        vec![pay(150_000)],
+    );
+    let err = mp.accept_tx(&onto_v2, &utxos, TIP_OK).unwrap_err();
+    assert!(matches!(err, AcceptError::Policy("truc-ancestor")), "{err}");
+
+    let v3_parent = ver_tx(&[ops[2]], 3, vec![pay(200_000), pay(200_000)]);
+    mp.accept_tx(&v3_parent, &utxos, TIP_OK).unwrap();
+    let v2_child = ver_tx(
+        &[OutPoint {
+            txid: v3_parent.compute_txid(),
+            vout: 0,
+        }],
+        2,
+        vec![pay(150_000)],
+    );
+    let err = mp.accept_tx(&v2_child, &utxos, TIP_OK).unwrap_err();
+    assert!(
+        matches!(err, AcceptError::Policy("truc-descendant")),
+        "{err}"
+    );
+
+    let child = ver_tx(
+        &[OutPoint {
+            txid: v3_parent.compute_txid(),
+            vout: 0,
+        }],
+        3,
+        vec![pay(150_000)],
+    );
+    mp.accept_tx(&child, &utxos, TIP_OK)
+        .expect("one version-3 child");
+    let sibling = ver_tx(
+        &[OutPoint {
+            txid: v3_parent.compute_txid(),
+            vout: 1,
+        }],
+        3,
+        vec![pay(150_000)],
+    );
+    let err = mp.accept_tx(&sibling, &utxos, TIP_OK).unwrap_err();
+    assert!(
+        matches!(err, AcceptError::Policy("truc-descendant-count")),
+        "{err}"
+    );
+    let grandchild = ver_tx(
+        &[OutPoint {
+            txid: child.compute_txid(),
+            vout: 0,
+        }],
+        3,
+        vec![pay(100_000)],
+    );
+    let err = mp.accept_tx(&grandchild, &utxos, TIP_OK).unwrap_err();
+    assert!(
+        matches!(err, AcceptError::Policy("truc-ancestor-count")),
+        "{err}"
+    );
+
+    let replacement = ver_tx(
+        &[OutPoint {
+            txid: v3_parent.compute_txid(),
+            vout: 0,
+        }],
+        3,
+        vec![pay(100_000)],
+    );
+    mp.accept_tx(&replacement, &utxos, TIP_OK)
+        .expect("replacing the only child is not a second descendant");
+    assert!(!mp.graph.contains(&child.compute_txid()));
+    assert!(mp.graph.contains(&replacement.compute_txid()));
+
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(&[400_000, 400_000]);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let left = ver_tx(&[ops[0]], 3, vec![pay(300_000)]);
+    let right = ver_tx(&[ops[1]], 3, vec![pay(300_000)]);
+    mp.accept_tx(&left, &utxos, TIP_OK).unwrap();
+    mp.accept_tx(&right, &utxos, TIP_OK).unwrap();
+    let two_parents = ver_tx(
+        &[
+            OutPoint {
+                txid: left.compute_txid(),
+                vout: 0,
+            },
+            OutPoint {
+                txid: right.compute_txid(),
+                vout: 0,
+            },
+        ],
+        3,
+        vec![pay(500_000)],
+    );
+    let err = mp.accept_tx(&two_parents, &utxos, TIP_OK).unwrap_err();
+    assert!(
+        matches!(err, AcceptError::Policy("truc-ancestor-count")),
+        "{err}"
+    );
+
+    let dir = tmp_dir();
+    let (op, _, utxos) = chain_utxo(2_000_000);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let huge = ver_tx(&[op], 3, vec![pay(100_000), truc_return_pad(40_100)]);
+    let err = mp.accept_tx(&huge, &utxos, TIP_OK).unwrap_err();
+    assert!(matches!(err, AcceptError::Policy("truc-size")), "{err}");
+
+    let parent = ver_tx(&[op], 3, vec![pay(1_500_000)]);
+    mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
+    let wide_child = ver_tx(
+        &[OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        }],
+        3,
+        vec![pay(1_000_000), truc_return_pad(4_100)],
+    );
+    let err = mp.accept_tx(&wide_child, &utxos, TIP_OK).unwrap_err();
+    assert!(
+        matches!(err, AcceptError::Policy("truc-child-size")),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let dir = tmp_dir();
+    let (op, _, utxos) = chain_utxo(2_000_000);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let wide_confirmed = ver_tx(&[op], 2, vec![pay(100_000), truc_return_pad(4_100)]);
+    mp.accept_tx(&wide_confirmed, &utxos, TIP_OK)
+        .expect("a non-version-3 transaction is not under the TRUC child cap");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `n` bare `OP_CHECKMULTISIG` outputs: legacy cost `n × 20 × 4`.
 fn multisig_outputs_tx(op: OutPoint, n: usize) -> Transaction {
     let mut tx = spend_tx(op, 1);
