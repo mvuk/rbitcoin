@@ -1,8 +1,12 @@
 {
-  "new_base": "cdfdaa0ef2b1fea88a1580adce5e42b6213aebac",
-  "new_skip": 5880,
-  "old_index": 10301,
-  "new_cap_used": true,
-  "run_id": "39905774114",
-  "old_name": "crates/rbitcoin-rpc/src/blockstats.rs:90:18: replace += with *= in percentiles_by_weight"
+  "new_base": "11db7a6445eebc40f503de9ab0e5b7d236ff042e",
+  "new_skip": 0,
+  "old_index": 0,
+  "new_cap_used": false,
+  "run_id": "",
+  "old_name": "",
+  "new_len": 0,
+  "new_remaining": 0,
+  "completed_new": 0,
+  "completed_old": 0
 }
