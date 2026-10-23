@@ -2499,23 +2499,15 @@ fn rpc_submit_nonstandard_version_is_version() {
             .contains(&parent.compute_txid()),
         "parent must admit: {pkg}"
     );
-    let v3 = Transaction {
-        version: TxVersion::non_standard(3),
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: parent.compute_txid(),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(4_999_998_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
+    // Spend a confirmed coin. A version-3 child of the version-2 parent
+    // above is a TRUC ancestor mismatch, which is a separate rule.
+    let (_, fresh) = mature_coinbase_spend(
+        &ctx,
+        4_999_998_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let mut v3 = fresh;
+    v3.version = TxVersion::non_standard(3);
     let v3_hex = rbitcoin_primitives::hex_encode(serialize(&v3));
     let sent = dispatch(&ctx, "sendrawtransaction", vec![json!(v3_hex)]).unwrap();
     assert_eq!(
