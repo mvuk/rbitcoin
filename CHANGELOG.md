@@ -16,6 +16,9 @@ before 1.0).
 - **`getnetworkinfo.version` stays 190000 by default.** `--rpc-client-version N`
   (conf `rpc_client_version=`, range 1–1000000) raises only that integer.
   Response shapes do not change. Bark captaind needs 310000.
+- **RPC submit admits `nVersion` 3.** `sendrawtransaction`, `testmempoolaccept`,
+  and `submitpackage` still reject every other version. P2P still admits any
+  version. Version 3 is the TRUC number Bark captaind broadcasts.
 
 ## [0.8.0] — 2026-10-09
 
