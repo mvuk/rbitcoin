@@ -2988,6 +2988,151 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+const ANCHOR_COIN: u64 = 50_0000_0000;
+
+fn zero_fee_anchor(coin: Txid, pay: u64) -> Transaction {
+    Transaction {
+        version: Version::non_standard(3),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coin,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(pay),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        ],
+    }
+}
+
+fn spend_anchor(parent: &Transaction, fund: Txid, pay: u64) -> Transaction {
+    Transaction {
+        version: Version::non_standard(3),
+        lock_time: LockTime::ZERO,
+        input: vec![
+            TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 1,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            },
+            TxIn {
+                previous_output: OutPoint {
+                    txid: fund,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            },
+        ],
+        output: vec![TxOut {
+            value: Amount::from_sat(pay),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    }
+}
+
+/// RPC `submitpackage` admits a 0-fee anchor only through package eval.
+///
+/// `accept_package` already allows one 0-value output when a later member
+/// spends it. The RPC path must reach that admit. A lone submit and a
+/// fee-paying 0-value output stay `dust`. A version-3 child of an
+/// unconfirmed version-2 parent stays `truc-ancestor`.
+#[test]
+fn submit_package_rpc_admits_zero_fee_anchor() {
+    let (_store, owned_q, owned_cbs) = pad_cbs(12);
+    let q = &owned_q;
+    let cbs = owned_cbs.as_slice();
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(q)).unwrap();
+    hub.set_relay_enabled(true);
+
+    let lone = zero_fee_anchor(cbs[0], ANCHOR_COIN);
+    let err = hub.accept_tx(&lone).expect_err("lone 0-fee anchor");
+    assert!(
+        matches!(err, AcceptError::Policy("dust")),
+        "sendraw of a 0-fee anchor must stay dust, got {err:?}"
+    );
+    let alone = hub.submit_package_rpc(std::slice::from_ref(&lone));
+    assert!(
+        matches!(alone[0].result, Err(AcceptError::Policy("dust"))),
+        "a one-member package must not waive dust, got {alone:?}"
+    );
+    assert!(!hub.try_contains(&lone.compute_txid()));
+
+    let parent = zero_fee_anchor(cbs[1], ANCHOR_COIN);
+    let child = spend_anchor(&parent, cbs[2], ANCHOR_COIN - 50_000);
+    let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
+    assert!(
+        rows.iter().all(|r| r.result.is_ok()),
+        "0-fee anchor parent + spending child must admit, got {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r.fee_with.as_ref().is_some_and(|ids| ids.len() == 2)),
+        "the anchor must clear inside the package remainder, got {rows:?}"
+    );
+    assert!(hub.try_contains(&parent.compute_txid()));
+    assert!(hub.try_contains(&child.compute_txid()));
+
+    let paying = zero_fee_anchor(cbs[3], ANCHOR_COIN - 10_000);
+    let paying_child = spend_anchor(&paying, cbs[4], ANCHOR_COIN - 50_000);
+    let paid = hub.submit_package_rpc(&[paying.clone(), paying_child]);
+    assert!(
+        matches!(paid[0].result, Err(AcceptError::Policy("dust"))),
+        "a fee-paying 0-value output stays dust inside a package, got {paid:?}"
+    );
+    assert!(!hub.try_contains(&paying.compute_txid()));
+
+    let v2 = spend_true(cbs[5], 5_000, ScriptBuf::from_bytes(vec![0x51]));
+    let v3 = Transaction {
+        version: Version::non_standard(3),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: v2.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(ANCHOR_COIN - 5_000 - 5_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let v3_id = v3.compute_txid();
+    let truc = hub.submit_package_rpc(&[v2.clone(), v3]);
+    assert!(
+        truc[0].result.is_ok(),
+        "the version-2 parent pays for itself, got {truc:?}"
+    );
+    assert!(
+        matches!(truc[1].result, Err(AcceptError::Policy("truc-ancestor"))),
+        "a version-3 child of an unconfirmed version-2 parent stays truc-ancestor, got {truc:?}"
+    );
+    assert!(hub.try_contains(&v2.compute_txid()));
+    assert!(!hub.try_contains(&v3_id));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A commit that evicts and then returns `mempool full` has already raised
 /// the rolling floor. The published atomic is what peers and Electrum read.
 #[test]

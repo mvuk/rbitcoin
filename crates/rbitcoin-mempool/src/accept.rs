@@ -1242,7 +1242,8 @@ impl ActiveMempool {
         Ok(())
     }
 
-    fn check_ephemeral_package(&self, txs: &[Transaction]) -> Result<(), AcceptError> {
+    #[doc(hidden)]
+    pub fn check_ephemeral_package(&self, txs: &[Transaction]) -> Result<(), AcceptError> {
         for (index, tx) in txs.iter().enumerate() {
             let zeros = zero_value_vouts(tx);
             if zeros.len() > 1 {
@@ -1274,7 +1275,8 @@ impl ActiveMempool {
         Ok(())
     }
 
-    fn member_ephemeral_ok(txs: &[Transaction], index: usize) -> bool {
+    #[doc(hidden)]
+    pub fn member_ephemeral_ok(txs: &[Transaction], index: usize) -> bool {
         let tx = &txs[index];
         let zeros = zero_value_vouts(tx);
         if zeros.len() != 1 {

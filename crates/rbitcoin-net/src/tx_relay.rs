@@ -477,12 +477,16 @@ pub fn fee_progress_due(elapsed: Duration) -> bool {
 #[doc(hidden)]
 pub fn package_rpc_retry(e: &AcceptError) -> bool {
     // A parent under the dynamic mempool floor is still package-eligible:
-    // Core `AcceptPackage` CPFPs it when the child pays.
+    // Core `AcceptPackage` CPFPs it when the child pays. One 0-value
+    // spendable output fails the individual admit as `dust` before that
+    // floor; the child is `Orphaned`, not `dust`. `accept_package` still
+    // decides whether the output may enter.
     matches!(
         e,
         AcceptError::Orphaned { .. }
             | AcceptError::Policy("min relay fee")
             | AcceptError::Policy("mempool min fee")
+            | AcceptError::Policy("dust")
     )
 }
 
@@ -708,6 +712,9 @@ pub struct AdmitSpec {
     pub min_relay: Option<u64>,
     /// This tx came from the current trusted session.
     pub waive: bool,
+    /// One 0-value spendable output is allowed when the fee is 0 and a later
+    /// package member spends it. Lone submit leaves this false.
+    pub ephemeral_ok: bool,
 }
 
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
@@ -2101,7 +2108,7 @@ impl MempoolHub {
                     report_orphans: spec.report_orphans,
                     min_relay: spec.min_relay,
                     waive: spec.waive,
-                    ephemeral_ok: false,
+                    ephemeral_ok: spec.ephemeral_ok,
                 },
             )
         };
@@ -2313,6 +2320,7 @@ impl MempoolHub {
             time_prepare_lock: false,
             min_relay: None,
             waive,
+            ephemeral_ok: false,
         };
         let prep = match self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us) {
             Ok(p) => p,
@@ -2418,6 +2426,7 @@ impl MempoolHub {
             time_prepare_lock: false,
             min_relay: Some(0),
             waive: false,
+            ephemeral_ok: false,
         };
         let prep_p = match self.admit_staged(&parent, utxo, spec_p, &mut stages, &mut lock_us) {
             Ok(p) => p,
@@ -2449,6 +2458,7 @@ impl MempoolHub {
             time_prepare_lock: false,
             min_relay: None,
             waive: false,
+            ephemeral_ok: false,
         };
         let prep_c = match self.admit_staged(child, utxo, spec_c, &mut stages, &mut lock_us) {
             Ok(p) => p,
@@ -2621,6 +2631,7 @@ impl MempoolHub {
             time_prepare_lock: false,
             min_relay: Some(0),
             waive,
+            ephemeral_ok: false,
         };
         let mut prep = self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us)?;
         prep.keep_mark = waive;
@@ -2827,6 +2838,7 @@ impl MempoolHub {
             time_prepare_lock: false,
             min_relay: None,
             waive: false,
+            ephemeral_ok: false,
         };
         let prep = match self.admit_staged(tx, &utxo, spec, &mut stages, &mut lock_us) {
             Ok(p) => p,
@@ -3100,6 +3112,7 @@ impl MempoolHub {
         let sat_kvb = self.min_relay_sat_kvb();
         let member_min = {
             let g = self.lock_read();
+            g.check_ephemeral_package(txs)?;
             let bps = g.graph.bytes_per_sigop();
             if g.package_meets_min_relay(txs, &utxo, sat_kvb, bps) {
                 Some(0)
@@ -3115,7 +3128,7 @@ impl MempoolHub {
         // prepare. Otherwise the parent just committed in this package is
         // rolled back and the child stays parked.
         let mut lifted: Vec<rbitcoin_mempool::LiftedOrphan> = Vec::new();
-        for tx in txs {
+        for (index, tx) in txs.iter().enumerate() {
             if let Some(parked) = {
                 let mut g = self.lock_write();
                 g.lift_parked_member(tx)
@@ -3130,6 +3143,7 @@ impl MempoolHub {
                 time_prepare_lock: true,
                 min_relay: member_min,
                 waive: false,
+                ephemeral_ok: ActiveMempool::member_ephemeral_ok(txs, index),
             };
             let prep = match self.admit_staged(tx, &utxo, spec, &mut stages, &mut lock_us) {
                 Ok(p) => p,
@@ -3583,6 +3597,7 @@ impl MempoolHub {
             time_prepare_lock: false,
             min_relay: None,
             waive: false,
+            ephemeral_ok: false,
         };
         let prep = match self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us) {
             Ok(p) => p,
@@ -4168,7 +4183,8 @@ impl MempoolHub {
     }
 
     /// Sequential submitpackage: keep successes, then package-evaluate
-    /// min-relay / missing-input remainders (Core `AcceptPackage`).
+    /// min-relay / missing-input / single-dust remainders (Core `AcceptPackage`
+    /// retries the first two; a 0-fee anchor is `dust` before the fee floor).
     ///
     /// Trim runs once at the end. A tx admitted on its own reports `fee_with =
     /// None`. A tx that only cleared the fee floor inside the remainder reports
@@ -4187,14 +4203,32 @@ impl MempoolHub {
     ) -> Vec<SubmitPackageRow> {
         let mut out: Vec<Result<AcceptResult, AcceptError>> =
             txs.iter().map(|tx| self.accept_tx_defer_trim(tx)).collect();
+        // `dust` is the anchor parent's own error. The child is missing
+        // inputs: `Orphaned` is already retryable, `MissingPrevout` is not.
+        // A one-member remainder never calls `accept_package`.
+        let ids: Vec<Txid> = txs.iter().map(|tx| tx.compute_txid()).collect();
+        let mut take = vec![false; txs.len()];
+        for (i, tx) in txs.iter().enumerate() {
+            if self.contains(&ids[i]) {
+                continue;
+            }
+            let Some(err) = out[i].as_ref().err() else {
+                continue;
+            };
+            let spends_taken = tx.input.iter().any(|inp| {
+                ids[..i]
+                    .iter()
+                    .zip(&take)
+                    .any(|(id, taken)| *taken && inp.previous_output.txid == *id)
+            });
+            take[i] = package_rpc_retry(err)
+                || (matches!(err, AcceptError::MissingPrevout(_)) && spends_taken);
+        }
         let rest: Vec<Transaction> = txs
             .iter()
-            .zip(out.iter())
-            .filter(|(tx, r)| {
-                r.as_ref().err().is_some_and(package_rpc_retry)
-                    && !self.contains(&tx.compute_txid())
-            })
-            .map(|(tx, _)| tx.clone())
+            .enumerate()
+            .filter(|(i, _)| take[*i])
+            .map(|(_, tx)| tx.clone())
             .collect();
         if package_eval && rest.len() >= 2 {
             match self.accept_package(&rest) {
