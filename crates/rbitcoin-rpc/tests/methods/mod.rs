@@ -55,6 +55,7 @@ fn open_ctx(dir: &TempDir) -> RpcContext {
 
         alert_notify: None,
         alert_fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        client_version: 190_000,
         blocksonly: false,
     }
 }
@@ -709,6 +710,17 @@ fn getnetworkinfo_localrelay_follows_mempool_relay() {
 }
 
 #[test]
+fn getnetworkinfo_version_follows_client_version() {
+    let (mut ctx, dir) = ctx_empty();
+    let def = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(def["version"], 190_000, "{def}");
+    ctx.client_version = 310_000;
+    let bumped = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(bumped["version"], 310_000, "{bumped}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn blocksonly_sendraw_admits_valid_tx() {
     let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
     ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
@@ -1104,6 +1116,7 @@ fn all_methods_callable_empty_or_error() {
 
         alert_notify: None,
         alert_fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        client_version: 190_000,
         blocksonly: false,
     };
     let mem2 = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
@@ -1535,6 +1548,7 @@ fn regtest_ctx(
 
         alert_notify: None,
         alert_fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        client_version: 190_000,
         blocksonly: false,
     };
     (ctx, dir, hub)
@@ -4770,6 +4784,7 @@ fn ctx_without_chain(src: &RpcContext) -> RpcContext {
         active: Arc::clone(&src.active),
         alert_notify: src.alert_notify.clone(),
         alert_fired: Arc::clone(&src.alert_fired),
+        client_version: src.client_version,
         blocksonly: src.blocksonly,
     }
 }
