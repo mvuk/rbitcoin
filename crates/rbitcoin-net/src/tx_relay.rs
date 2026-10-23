@@ -2101,6 +2101,7 @@ impl MempoolHub {
                     report_orphans: spec.report_orphans,
                     min_relay: spec.min_relay,
                     waive: spec.waive,
+                    ephemeral_ok: false,
                 },
             )
         };
