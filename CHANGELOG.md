@@ -19,6 +19,11 @@ before 1.0).
 - **RPC submit admits `nVersion` 3.** `sendrawtransaction`, `testmempoolaccept`,
   and `submitpackage` still reject every other version. P2P still admits any
   version. Version 3 is the TRUC number Bark captaind broadcasts.
+- **Version 3 follows BIP 431 TRUC on admission.** One unconfirmed ancestor,
+  one unconfirmed descendant, 10,000 vB, and 1,000 vB as a child of an
+  unconfirmed parent. Other versions are unchanged. A replacement of the
+  existing child is not a second descendant. A non-conflicting second child
+  is rejected (`truc-descendant-count`) rather than evicted.
 
 ## [0.8.0] — 2026-10-09
 

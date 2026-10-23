@@ -1114,6 +1114,83 @@ impl ActiveMempool {
         Ok(scan)
     }
 
+    /// BIP 431 limits for version 3, and version inheritance either way.
+    ///
+    /// A version-3 transaction may have one unconfirmed ancestor and, through
+    /// that ancestor, one unconfirmed descendant. It is at most 10,000 vB, and
+    /// at most 1,000 vB when that ancestor is unconfirmed. vsize is the
+    /// sigop-adjusted weight already used for the fee floor. A descendant that
+    /// this transaction directly conflicts with does not count, so a replacement
+    /// of the existing child is not a second descendant. A non-conflicting
+    /// second child is rejected. This does not evict that sibling.
+    fn check_truc(&self, tx: &Transaction, adjusted_weight: u64) -> Result<(), AcceptError> {
+        let v3 = tx.version.0 == 3;
+        let mut parents = BTreeSet::new();
+        for inp in &tx.input {
+            if let Some(parent) = self.graph.creator(&inp.previous_output) {
+                parents.insert(parent);
+            }
+        }
+        for parent in &parents {
+            let parent_tx = self
+                .bodies
+                .get(parent)
+                .ok_or_else(|| AcceptError::Durable("parent body missing".into()))?;
+            let parent_v3 = parent_tx.version.0 == 3;
+            if v3 && !parent_v3 {
+                return Err(AcceptError::Policy("truc-ancestor"));
+            }
+            if !v3 && parent_v3 {
+                return Err(AcceptError::Policy("truc-descendant"));
+            }
+        }
+        if !v3 {
+            return Ok(());
+        }
+        let vsize = adjusted_weight.div_ceil(4);
+        if vsize > 10_000 {
+            return Err(AcceptError::Policy("truc-size"));
+        }
+        if parents.len() > 1 {
+            return Err(AcceptError::Policy("truc-ancestor-count"));
+        }
+        let Some(parent) = parents.iter().next().copied() else {
+            return Ok(());
+        };
+        let anc = self
+            .graph
+            .ancestor_set(&parent)
+            .ok_or_else(|| AcceptError::Durable("parent body missing".into()))?;
+        // `ancestor_set` includes the parent. The child adds one.
+        if anc.len() + 1 > 2 {
+            return Err(AcceptError::Policy("truc-ancestor-count"));
+        }
+        if vsize > 1_000 {
+            return Err(AcceptError::Policy("truc-child-size"));
+        }
+        let desc = self
+            .graph
+            .descendant_set(&parent)
+            .ok_or_else(|| AcceptError::Durable("parent body missing".into()))?;
+        let mut direct = Vec::new();
+        for inp in &tx.input {
+            if let Some(conflict) = self.graph.conflict_txid(&inp.previous_output) {
+                if !direct.contains(&conflict) {
+                    direct.push(conflict);
+                }
+            }
+        }
+        let doomed = self.graph.conflict_set(&direct);
+        let survivors = desc
+            .iter()
+            .filter(|id| **id != parent && !doomed.contains(*id))
+            .count();
+        if survivors > 0 {
+            return Err(AcceptError::Policy("truc-descendant-count"));
+        }
+        Ok(())
+    }
+
     /// Graph peek + UTXO resolve (`&self`: callers may hold a read lock).
     ///
     /// `report_orphans`: missing parents become [`AcceptError::Orphaned`] (caller
@@ -1199,6 +1276,9 @@ impl ActiveMempool {
                 "min relay fee"
             }));
         }
+        // BIP 431 topology. Inherent replaceability is already full RBF, and
+        // the package feerate waiver already lets a below-min-relay child in.
+        self.check_truc(tx, adj)?;
         let trust_warn = trust_structural
             .as_ref()
             .map(|err| vec![err.mempool_reject_reason()]);
