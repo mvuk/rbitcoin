@@ -13,6 +13,11 @@ before 1.0).
 
 - **Workspace version 0.8.99:** in-tree toward 0.9.0.
   Published GitHub Releases remain 0.8.0; `v0.8.x` is the patch branch.
+- **One 0-value spendable output can enter with a package.** The transaction
+  fee must be 0, and a later package member must spend that output. A child
+  that spends the parent and leaves the output is `missing-ephemeral-spends`.
+  A fee-paying transaction, a second 0-value output, and a lone submit stay
+  `dust`. `OP_RETURN` and outputs of 1 sat or more are unchanged.
 
 ## [0.8.0] — 2026-10-09
 

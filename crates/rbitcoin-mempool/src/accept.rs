@@ -290,6 +290,14 @@ impl From<MempoolError> for AcceptError {
     }
 }
 
+fn zero_value_vouts(tx: &Transaction) -> Vec<u32> {
+    tx.output
+        .iter()
+        .enumerate()
+        .filter_map(|(index, out)| policy::is_zero_value_spendable(out).then_some(index as u32))
+        .collect()
+}
+
 fn is_trust_tx_fault(err: &AcceptError) -> bool {
     matches!(
         err,
@@ -484,6 +492,9 @@ pub struct PrepareOpts {
     pub report_orphans: bool,
     pub min_relay: Option<u64>,
     pub waive: bool,
+    /// One 0-value spendable output is allowed when the fee is 0 and a
+    /// later package member spends it. Lone submit leaves this false.
+    pub ephemeral_ok: bool,
 }
 
 /// Result of accept prepare (resolve + policy + structural), before script verify.
@@ -995,7 +1006,18 @@ impl ActiveMempool {
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
         self.last_accept_stages = AcceptStageUs::default();
-        match self.accept_tx_with(tx, utxos, tip, 0, true, None) {
+        match self.accept_tx_with(
+            tx,
+            utxos,
+            tip,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: true,
+                min_relay: None,
+                waive: false,
+                ephemeral_ok: false,
+            },
+        ) {
             Ok(r) => {
                 self.promote_orphans_of(r.txid, utxos, tip);
                 Ok(r)
@@ -1015,11 +1037,16 @@ impl ActiveMempool {
         tx: &Transaction,
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
-        fee_delta: i64,
-        report_orphans: bool,
-        min_relay: Option<u64>,
+        opts: PrepareOpts,
     ) -> Result<AcceptResult, AcceptError> {
         // Local `accept_tx` stays strict. The session bit is on the hub admit.
+        let PrepareOpts {
+            fee_delta,
+            report_orphans,
+            min_relay,
+            ephemeral_ok,
+            waive: _,
+        } = opts;
         let waive = false;
         let mut prep = self.prepare_admit(
             tx,
@@ -1030,6 +1057,7 @@ impl ActiveMempool {
                 report_orphans,
                 min_relay,
                 waive,
+                ephemeral_ok,
             },
         )?;
         self.last_accept_stages.utxo_us = prep.utxo_us;
@@ -1114,6 +1142,76 @@ impl ActiveMempool {
         Ok(scan)
     }
 
+    fn reject_unspent_parent_dust(&self, tx: &Transaction) -> Result<(), AcceptError> {
+        let mut seen = BTreeSet::new();
+        for inp in &tx.input {
+            let Some(parent) = self.graph.creator(&inp.previous_output) else {
+                continue;
+            };
+            if !seen.insert(parent) {
+                continue;
+            }
+            let parent_tx = self
+                .bodies
+                .get(&parent)
+                .ok_or_else(|| AcceptError::Durable("parent body missing".into()))?;
+            for vout in zero_value_vouts(parent_tx) {
+                let dust = OutPoint { txid: parent, vout };
+                if !tx.input.iter().any(|inp| inp.previous_output == dust) {
+                    return Err(AcceptError::Policy("missing-ephemeral-spends"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_ephemeral_package(&self, txs: &[Transaction]) -> Result<(), AcceptError> {
+        for (index, tx) in txs.iter().enumerate() {
+            let zeros = zero_value_vouts(tx);
+            if zeros.len() > 1 {
+                return Err(AcceptError::Policy("dust"));
+            }
+            if zeros.len() != 1 {
+                continue;
+            }
+            let dust = OutPoint {
+                txid: tx.compute_txid(),
+                vout: zeros[0],
+            };
+            let mut spends_parent = false;
+            let mut spends_dust = false;
+            for child in &txs[index + 1..] {
+                for inp in &child.input {
+                    if inp.previous_output.txid == dust.txid {
+                        spends_parent = true;
+                    }
+                    if inp.previous_output == dust {
+                        spends_dust = true;
+                    }
+                }
+            }
+            if spends_parent && !spends_dust {
+                return Err(AcceptError::Policy("missing-ephemeral-spends"));
+            }
+        }
+        Ok(())
+    }
+
+    fn member_ephemeral_ok(txs: &[Transaction], index: usize) -> bool {
+        let tx = &txs[index];
+        let zeros = zero_value_vouts(tx);
+        if zeros.len() != 1 {
+            return false;
+        }
+        let dust = OutPoint {
+            txid: tx.compute_txid(),
+            vout: zeros[0],
+        };
+        txs[index + 1..]
+            .iter()
+            .any(|child| child.input.iter().any(|inp| inp.previous_output == dust))
+    }
+
     /// Graph peek + UTXO resolve (`&self`: callers may hold a read lock).
     ///
     /// `report_orphans`: missing parents become [`AcceptError::Orphaned`] (caller
@@ -1130,6 +1228,7 @@ impl ActiveMempool {
             report_orphans,
             min_relay,
             waive,
+            ephemeral_ok,
         } = opts;
         if tx.is_coinbase() {
             return Err(AcceptError::Coinbase);
@@ -1186,11 +1285,23 @@ impl ActiveMempool {
         let floor = self.mempool_min_fee_sat_kvb();
         let min_relay = min_relay.unwrap_or(floor);
         // Standardness on raw weight; the fee floor on sigop-adjusted vsize.
-        if let PolicyResult::NonStandard(s) =
+        // A 0-fee transaction may carry one 0-value spendable output when the
+        // caller is a package whose child spends it. Any other 0-value
+        // spendable output is still dust, including a lone submit.
+        let zeros = zero_value_vouts(tx);
+        let allow_ephemeral = ephemeral_ok && zeros.len() == 1 && fee_sat == 0 && admit_fee == 0;
+        if zeros.len() > 1 || (zeros.len() == 1 && !allow_ephemeral) {
+            return Err(AcceptError::Policy("dust"));
+        }
+        let shape = if allow_ephemeral {
+            policy::check_libre_shape_allow_ephemeral(tx, weight)
+        } else {
             policy::check_libre_admission_at(tx, admit_fee, weight, 0)
-        {
+        };
+        if let PolicyResult::NonStandard(s) = shape {
             return Err(AcceptError::Policy(s));
         }
+        self.reject_unspent_parent_dust(tx)?;
         let adj = sigops_adjusted_weight(weight, sigop_cost, self.graph.bytes_per_sigop());
         if !policy::meets_min_relay_fee_at(admit_fee, adj, min_relay) {
             return Err(AcceptError::Policy(if floor > self.min_relay_sat_kvb {
@@ -1692,7 +1803,18 @@ impl ActiveMempool {
         let mut queue = VecDeque::new();
         self.push_orphan_children(parent, &mut queue);
         while let Some(child) = queue.pop_front() {
-            match self.accept_tx_with(&child.tx, utxos, tip, 0, true, None) {
+            match self.accept_tx_with(
+                &child.tx,
+                utxos,
+                tip,
+                PrepareOpts {
+                    fee_delta: 0,
+                    report_orphans: true,
+                    min_relay: None,
+                    waive: false,
+                    ephemeral_ok: false,
+                },
+            ) {
                 Ok(r) => {
                     self.orphanage
                         .forget_taken_gen(&child.tx.compute_txid(), child.taken_gen);
@@ -1941,6 +2063,7 @@ impl ActiveMempool {
         tip: ChainTipCtx,
     ) -> Result<Vec<AcceptResult>, AcceptError> {
         Self::check_package_shape(txs)?;
+        self.check_ephemeral_package(txs)?;
 
         self.last_accept_stages = AcceptStageUs::default();
         let member_min = if self.package_meets_min_relay(
@@ -1959,19 +2082,42 @@ impl ActiveMempool {
         // every member is committed, so this walk cannot admit a later
         // member and then roll it back as a duplicate.
         let mut lifted: Vec<LiftedOrphan> = Vec::new();
-        for tx in txs {
+        for (index, tx) in txs.iter().enumerate() {
             if let Some(parked) = self.lift_parked_member(tx) {
                 lifted.push(parked);
             }
+            let ephemeral_ok = Self::member_ephemeral_ok(txs, index);
             // accept_tx_with (not top-level accept_tx) so stages are not reset per member.
-            match self.accept_tx_with(tx, utxos, tip, 0, true, member_min) {
+            match self.accept_tx_with(
+                tx,
+                utxos,
+                tip,
+                PrepareOpts {
+                    fee_delta: 0,
+                    report_orphans: true,
+                    min_relay: member_min,
+                    waive: false,
+                    ephemeral_ok,
+                },
+            ) {
                 Ok(r) => accepted.push(r),
                 Err(e) => {
                     self.restore_undone(utxos, tip);
                     self.rollback_accepted_package(&accepted, utxos, tip);
                     for item in self.repark_lifted(&lifted, utxos, tip, &|_| 0, None) {
                         let id = item.tx.compute_txid();
-                        match self.accept_tx_with(&item.tx, utxos, tip, 0, true, None) {
+                        match self.accept_tx_with(
+                            &item.tx,
+                            utxos,
+                            tip,
+                            PrepareOpts {
+                                fee_delta: 0,
+                                report_orphans: true,
+                                min_relay: None,
+                                waive: false,
+                                ephemeral_ok: false,
+                            },
+                        ) {
                             Ok(r) => {
                                 // Admitted, so the lift row is not in flight.
                                 self.orphanage.forget_taken_gen(&id, item.taken_gen);
@@ -2053,6 +2199,7 @@ impl ActiveMempool {
                     report_orphans: true,
                     min_relay: None,
                     waive: trusted.is_some_and(|id| item.announcers.contains(&id)),
+                    ephemeral_ok: false,
                 },
             ) {
                 Err(AcceptError::Orphaned { missing, .. }) => {
@@ -2183,6 +2330,9 @@ impl ActiveMempool {
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
         let waive = self.trust_kept.contains(&tx.compute_txid());
+        // Restoring a 0-fee anchor parent must not bounce it as dust.
+        // A fee-paying transaction with a 0-value output still fails below.
+        let ephemeral_ok = zero_value_vouts(tx).len() == 1;
         let mut prep = self.prepare_admit(
             tx,
             utxos,
@@ -2192,6 +2342,7 @@ impl ActiveMempool {
                 report_orphans: false,
                 min_relay: Some(0),
                 waive,
+                ephemeral_ok,
             },
         )?;
         prep.keep_mark = waive;

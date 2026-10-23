@@ -425,6 +425,7 @@ fn prepare_admit_output_sum_overflow_is_policy_not_panic() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                ephemeral_ok: false,
             },
         )
         .expect_err("overflowing output sum");
@@ -451,6 +452,7 @@ fn prepare_admit_rejects_negative_fee() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                ephemeral_ok: false,
             },
         )
         .expect_err("outputs exceed inputs");
@@ -715,6 +717,7 @@ fn evaluate_after_script_rbf_leaves_conflict() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                ephemeral_ok: false,
             },
         )
         .unwrap();
@@ -764,6 +767,7 @@ fn evaluate_after_script_enforces_cluster_limits() {
                     report_orphans: true,
                     min_relay: None,
                     waive: false,
+                    ephemeral_ok: false,
                 },
             )
             .unwrap();
@@ -804,6 +808,7 @@ fn commit_after_script_does_not_take_utxo_provider() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                ephemeral_ok: false,
             },
         )
         .unwrap();
@@ -829,6 +834,7 @@ fn prepare_admit_stashes_txid() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                ephemeral_ok: false,
             },
         )
         .unwrap();
@@ -856,6 +862,7 @@ fn commit_after_script_parent_body_missing_is_durable() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                ephemeral_ok: false,
             },
         )
         .unwrap();
@@ -2025,6 +2032,7 @@ fn duplicate_commit_after_prepare_is_duplicate() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                ephemeral_ok: false,
             },
         )
         .unwrap();
@@ -2174,6 +2182,7 @@ fn waive_opts() -> PrepareOpts {
         report_orphans: true,
         min_relay: None,
         waive: true,
+        ephemeral_ok: false,
     }
 }
 
@@ -2639,6 +2648,7 @@ fn review_trust_failed_restore_drops_mark() {
                 report_orphans: false,
                 min_relay: Some(0),
                 waive: false,
+                ephemeral_ok: false,
             },
         )
         .expect("replacement prepares");
@@ -3365,6 +3375,103 @@ fn package_rollback_reject_drops_the_inflight_row() {
     assert!(
         !mp.orphanage.has_announcer(4),
         "a rejected lift must not keep its peer"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn anchor_tx(inputs: &[OutPoint], pay: u64, anchor: u64) -> Transaction {
+    Transaction {
+        version: Version::non_standard(3),
+        lock_time: LockTime::ZERO,
+        input: inputs
+            .iter()
+            .copied()
+            .map(|previous_output| TxIn {
+                previous_output,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(pay),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            TxOut {
+                value: Amount::from_sat(anchor),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        ],
+    }
+}
+
+#[test]
+fn ephemeral_anchor_enters_only_inside_a_package() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(&[50_000, 20_000, 50_000, 20_000, 50_000]);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+
+    let lone = anchor_tx(&[ops[0]], 50_000, 0);
+    let err = mp.accept_tx(&lone, &utxos, TIP_OK).unwrap_err();
+    assert!(matches!(err, AcceptError::Policy("dust")), "{err}");
+
+    let parent = anchor_tx(&[ops[0]], 50_000, 0);
+    let child = anchor_tx(
+        &[
+            OutPoint {
+                txid: parent.compute_txid(),
+                vout: 1,
+            },
+            ops[1],
+        ],
+        10_000,
+        1,
+    );
+    mp.accept_package(&[parent.clone(), child], &utxos, TIP_OK)
+        .expect("0-fee parent with one 0-value output, spent by the child");
+
+    let paying = anchor_tx(&[ops[2]], 40_000, 0);
+    let paying_child = anchor_tx(
+        &[
+            OutPoint {
+                txid: paying.compute_txid(),
+                vout: 1,
+            },
+            ops[3],
+        ],
+        10_000,
+        1,
+    );
+    let err = mp
+        .accept_package(&[paying, paying_child], &utxos, TIP_OK)
+        .unwrap_err();
+    assert!(matches!(err, AcceptError::Policy("dust")), "{err}");
+
+    let skipped = anchor_tx(&[ops[4]], 50_000, 0);
+    let spends_value = Transaction {
+        version: Version::non_standard(3),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: skipped.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(40_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let err = mp
+        .accept_package(&[skipped, spends_value], &utxos, TIP_OK)
+        .unwrap_err();
+    assert!(
+        matches!(err, AcceptError::Policy("missing-ephemeral-spends")),
+        "{err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
