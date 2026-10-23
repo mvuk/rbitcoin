@@ -1,8 +1,8 @@
 {
   "new_base": "cdfdaa0ef2b1fea88a1580adce5e42b6213aebac",
   "new_skip": 5880,
-  "old_index": 9751,
+  "old_index": 10301,
   "new_cap_used": true,
   "run_id": "39905774114",
-  "old_name": "crates/rbitcoin-query/src/scripthash.rs:135:9: replace HistoryFilter::open -> Self with Default::default()"
+  "old_name": "crates/rbitcoin-rpc/src/blockstats.rs:90:18: replace += with *= in percentiles_by_weight"
 }
