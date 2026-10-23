@@ -13,6 +13,9 @@ before 1.0).
 
 - **Workspace version 0.8.99:** in-tree toward 0.9.0.
   Published GitHub Releases remain 0.8.0; `v0.8.x` is the patch branch.
+- **RPC submit admits `nVersion` 3.** `sendrawtransaction`, `testmempoolaccept`,
+  and `submitpackage` still reject every other version. P2P still admits any
+  version. Version 3 is the TRUC number Bark captaind broadcasts.
 
 ## [0.8.0] — 2026-10-09
 
