@@ -1235,6 +1235,17 @@ fn mempool_txid_lookups_do_not_list_live() {
 
 /// Graph fields come from the cluster, not stub 1/0. Local sendraw is
 /// unbroadcast until a peer getdata completes.
+/// Core `bip125-replaceable` on each mempool entry.
+fn assert_bip125(entries: &[&Value], want: bool) {
+    for e in entries {
+        assert_eq!(e["bip125-replaceable"], want, "{e}");
+    }
+}
+
+fn verbose_child(ctx: &RpcContext, txid_hex: &str) -> Value {
+    dispatch(ctx, "getrawmempool", vec![json!(true)]).unwrap()[txid_hex].clone()
+}
+
 #[test]
 fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     use bitcoin::absolute::LockTime;
@@ -1273,7 +1284,7 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
                 vout: 0,
             },
             script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         output: vec![TxOut {
@@ -1297,6 +1308,15 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     assert_eq!(parent_entry["spentby"], json!([child_hex.clone()]));
     assert_eq!(child_entry["depends"], json!([parent_hex.clone()]));
     assert_eq!(child_entry["spentby"], json!([]));
+    // The child does not signal itself; its unconfirmed parent does.
+    assert_bip125(
+        &[
+            &parent_entry,
+            &child_entry,
+            &verbose_child(&ctx, &child_hex),
+        ],
+        true,
+    );
 
     let verbose = dispatch(&ctx, "getrawmempool", vec![json!(true)]).unwrap();
     assert_eq!(verbose[&child_hex]["ancestorcount"], 2);
@@ -1319,7 +1339,7 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
                 vout: 0,
             },
             script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         output: vec![TxOut {
@@ -1339,6 +1359,7 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     let local_entry = dispatch(&ctx, "getmempoolentry", vec![json!(local_hex.clone())]).unwrap();
     assert_eq!(local_entry["unbroadcast"], true);
     assert_eq!(local_entry["ancestorcount"], 1);
+    assert_bip125(&[&local_entry], false);
 
     mp.mark_broadcast(&local.compute_txid());
     let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
