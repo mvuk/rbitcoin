@@ -983,8 +983,10 @@ pub fn disconnected_block_value(
         insert_previousblockhash(&mut obj, &hash_hex_display(&prev));
     }
     enrich_block_header_json(&mut obj, ctx, version, bits, None, Some(chainwork));
+    // Core sends size, strippedsize and weight from verbosity 1, for a stale
+    // block too. A reorg-aware client (BDK's emitter) requires them.
+    insert_block_size_fields(&mut obj, block);
     if verbosity >= 2 {
-        insert_block_size_fields(&mut obj, block);
         obj["tx"] = json!(getblock_v2_tx_json(ctx, block));
     }
     Ok(obj)

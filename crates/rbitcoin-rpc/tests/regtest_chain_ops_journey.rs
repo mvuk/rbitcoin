@@ -2644,6 +2644,11 @@ fn chain_ops_invalidate_and_precious(
     assert!(held["difficulty"].as_f64().is_some(), "held difficulty: {held}");
     assert_eq!(held["versionHex"].as_str().expect("held versionHex").len(), 8);
     assert!(held.get("nextblockhash").is_none());
+    // Core's verbosity 1 carries the size fields for a stale block too.
+    assert_eq!(held["size"], sibling.total_size(), "{held}");
+    let stripped = (sibling.weight().to_wu() as usize - sibling.total_size()) / 3;
+    assert_eq!(held["strippedsize"], stripped, "{held}");
+    assert_eq!(held["weight"], sibling.weight().to_wu(), "{held}");
 
     dispatch(ctx, "preciousblock", vec![sib.clone()]).unwrap();
     assert_eq!(best_hash(ctx), sib);
