@@ -2487,11 +2487,7 @@ fn rpc_submit_nonstandard_version_is_version() {
     );
     // Spend a confirmed coin. A version-3 child of the version-2 parent
     // above is a TRUC ancestor mismatch, which is a separate rule.
-    let (_, fresh) = mature_coinbase_spend(
-        &ctx,
-        4_999_998_000,
-        ScriptBuf::from_bytes(vec![0x51]),
-    );
+    let (_, fresh) = mature_coinbase_spend(&ctx, 4_999_998_000, ScriptBuf::from_bytes(vec![0x51]));
     let mut v3 = fresh;
     v3.version = TxVersion::non_standard(3);
     let v3_hex = rbitcoin_primitives::hex_encode(serialize(&v3));

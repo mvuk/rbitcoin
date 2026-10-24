@@ -5194,3 +5194,86 @@ fn review_trust_recent_reject_does_not_drop_session_tx() {
     let _ = std::fs::remove_dir_all(&mp_dir);
     let _ = std::fs::remove_dir_all(&store);
 }
+
+/// A 0-fee parent with one 0-value anchor arrives alone from a peer, then
+/// the child that spends the anchor and pays the fee. Core keeps the parent
+/// as a reconsiderable reject and admits both as a 1p1c package; the anchor
+/// is only dust outside a package.
+#[test]
+fn peer_anchor_parent_then_child_admit_as_1p1c() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let peer = Some(7u64);
+
+    let mut parent = spend_true(cbs[4], 0, ScriptBuf::from_bytes(vec![0x51]));
+    parent.version = bitcoin::transaction::Version::non_standard(3);
+    parent.output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    });
+    let pid = parent.compute_txid();
+    assert!(matches!(
+        hub.accept_tx_from(&parent, peer),
+        Err(AcceptError::Policy("dust"))
+    ));
+    assert!(
+        !hub.try_recent_reject(&parent.compute_wtxid()),
+        "a lone anchor parent is reconsiderable, not a hard reject"
+    );
+
+    let mut child = spend_vout(OutPoint::new(pid, 1), 0);
+    child.version = bitcoin::transaction::Version::non_standard(3);
+    child.input.push(TxIn {
+        previous_output: OutPoint::new(pid, 0),
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+        witness: Witness::new(),
+    });
+    child.output[0].value = Amount::from_sat(50_0000_0000 - 2_000);
+    hub.accept_tx_from(&child, peer)
+        .expect("parent and child from a peer admit as 1p1c");
+    assert!(hub.contains(&pid));
+    assert!(hub.contains(&child.compute_txid()));
+}
+
+/// The same pair in the other order: the child arrives first and waits in
+/// the orphanage, then the lone anchor parent. Core's 1p1c finds the waiting
+/// child when the parent is rejected as reconsiderable and admits both.
+#[test]
+fn peer_anchor_child_then_parent_admit_as_1p1c() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let peer = Some(7u64);
+
+    let mut parent = spend_true(cbs[5], 0, ScriptBuf::from_bytes(vec![0x51]));
+    parent.version = bitcoin::transaction::Version::non_standard(3);
+    parent.output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    });
+    let pid = parent.compute_txid();
+    let mut child = spend_vout(OutPoint::new(pid, 1), 0);
+    child.version = bitcoin::transaction::Version::non_standard(3);
+    child.input.push(TxIn {
+        previous_output: OutPoint::new(pid, 0),
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+        witness: Witness::new(),
+    });
+    child.output[0].value = Amount::from_sat(50_0000_0000 - 2_000);
+
+    assert!(matches!(
+        hub.accept_tx_from(&child, peer),
+        Err(AcceptError::Orphaned { .. })
+    ));
+    assert_eq!(hub.orphan_count(), 1);
+    hub.accept_tx_from(&parent, peer)
+        .expect("the waiting child admits the anchor parent as 1p1c");
+    assert!(hub.contains(&pid));
+    assert!(hub.contains(&child.compute_txid()));
+    assert_eq!(hub.orphan_count(), 0);
+}

@@ -1275,6 +1275,12 @@ impl ActiveMempool {
         Ok(())
     }
 
+    /// One 0-value spendable output: `dust` alone, admissible as the parent
+    /// of a package whose child spends that output.
+    pub fn is_anchor_parent(tx: &Transaction) -> bool {
+        zero_value_vouts(tx).len() == 1
+    }
+
     #[doc(hidden)]
     pub fn member_ephemeral_ok(txs: &[Transaction], index: usize) -> bool {
         let tx = &txs[index];
@@ -1539,6 +1545,20 @@ impl ActiveMempool {
     }
 
     /// Take orphans waiting on `parent` (hub promote outside the write lock).
+    /// Orphans waiting only on `parent`, left in place (a package admit
+    /// takes the one it uses).
+    pub fn orphans_waiting_only_on(&self, parent: Txid) -> Vec<Transaction> {
+        let Some(children) = self.orphanage.by_parent.get(&parent) else {
+            return Vec::new();
+        };
+        children
+            .iter()
+            .filter_map(|txid| self.orphanage.by_txid.get(txid))
+            .filter(|entry| entry.missing.len() == 1)
+            .map(|entry| entry.tx.clone())
+            .collect()
+    }
+
     pub fn take_orphan_children(&mut self, parent: Txid) -> Vec<OrphanSnapshot> {
         self.orphanage.take_children_of(&parent)
     }
@@ -2683,6 +2703,10 @@ impl ActiveMempool {
                 Some(AcceptFailureRecord::Invalid(tx.compute_txid()))
             }
             AcceptError::Policy("min relay fee") => Some(AcceptFailureRecord::Extra),
+            // A lone anchor parent waits for the child that spends it.
+            AcceptError::Policy("dust") if Self::is_anchor_parent(tx) => {
+                Some(AcceptFailureRecord::Extra)
+            }
             _ => None,
         }
     }

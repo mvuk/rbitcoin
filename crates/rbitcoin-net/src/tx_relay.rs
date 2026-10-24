@@ -2350,12 +2350,10 @@ impl MempoolHub {
                             },
                         );
                     }
-                    if from.is_none() {
-                        if let Some(r) = self.admit_1p1c(tx, utxo, missing) {
-                            let us = t0.elapsed().as_micros() as u64;
-                            self.meter_accept_wall(us, true);
-                            return Ok(r);
-                        }
+                    if let Some(r) = self.admit_1p1c(tx, utxo, missing, from.is_some()) {
+                        let us = t0.elapsed().as_micros() as u64;
+                        self.meter_accept_wall(us, true);
+                        return Ok(r);
                     }
                     let parked = {
                         let mut g = self.lock_write();
@@ -2368,6 +2366,15 @@ impl MempoolHub {
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
                     return self.finish_accept_err(us, parked);
+                }
+                if matches!(e, AcceptError::Policy("dust"))
+                    && rbitcoin_mempool::ActiveMempool::is_anchor_parent(tx)
+                {
+                    if let Some(r) = self.admit_anchor_with_waiting_child(tx) {
+                        let us = t0.elapsed().as_micros() as u64;
+                        self.meter_accept_wall(us, true);
+                        return Ok(r);
+                    }
                 }
                 self.note_if_accept_failure(tx, &e);
                 let us = t0.elapsed().as_micros() as u64;
@@ -2407,17 +2414,38 @@ impl MempoolHub {
         }
     }
 
+    /// A lone anchor parent whose child already waits in the orphanage (it
+    /// arrived first). Admit the pair through the package path, as Core's
+    /// 1p1c does when it finds the orphan child of a reconsiderable reject.
+    fn admit_anchor_with_waiting_child(&self, parent: &Transaction) -> Option<AcceptResult> {
+        let children = self
+            .lock_read()
+            .orphans_waiting_only_on(parent.compute_txid());
+        children.into_iter().find_map(|child| {
+            self.accept_package(&[parent.clone(), child])
+                .ok()
+                .and_then(|mut results| (!results.is_empty()).then(|| results.remove(0)))
+        })
+    }
+
     #[doc(hidden)]
     pub fn admit_1p1c(
         &self,
         child: &Transaction,
         utxo: &impl rbitcoin_mempool::UtxoProvider,
         missing: &std::collections::BTreeSet<Txid>,
+        from_peer: bool,
     ) -> Option<AcceptResult> {
         let parent = {
             let g = self.lock_read();
             g.try_one_parent_package(child, missing, utxo)?
         };
+        // A peer's child of a low-fee parent stays an orphan until the parent
+        // is promoted. A lone anchor parent never enters alone, so its child
+        // is the only way in: admit the pair, as Core's 1p1c does.
+        if from_peer && !rbitcoin_mempool::ActiveMempool::is_anchor_parent(&parent) {
+            return None;
+        }
         let mut stages = rbitcoin_mempool::AcceptStageUs::default();
         let mut lock_us = 0u64;
         let spec_p = AdmitSpec {
@@ -2426,7 +2454,12 @@ impl MempoolHub {
             time_prepare_lock: false,
             min_relay: Some(0),
             waive: false,
-            ephemeral_ok: false,
+            // The parent's one 0-value output may enter when this child
+            // spends it, as in `submitpackage`.
+            ephemeral_ok: rbitcoin_mempool::ActiveMempool::member_ephemeral_ok(
+                &[parent.clone(), child.clone()],
+                0,
+            ),
         };
         let prep_p = match self.admit_staged(&parent, utxo, spec_p, &mut stages, &mut lock_us) {
             Ok(p) => p,
@@ -2692,7 +2725,11 @@ impl MempoolHub {
 
     #[doc(hidden)]
     pub fn note_if_accept_failure(&self, tx: &Transaction, e: &AcceptError) {
-        if is_hard_recent_reject(e) {
+        // A lone anchor parent is `dust` but reconsiderable: its child may
+        // arrive next and admit both as 1p1c (Core keeps it the same way).
+        let anchor_parent = matches!(e, AcceptError::Policy("dust"))
+            && rbitcoin_mempool::ActiveMempool::is_anchor_parent(tx);
+        if is_hard_recent_reject(e) && !anchor_parent {
             self.note_recent_reject(tx.compute_wtxid());
         }
         if let Some(rec) = rbitcoin_mempool::ActiveMempool::accept_failure_record(tx, e) {
