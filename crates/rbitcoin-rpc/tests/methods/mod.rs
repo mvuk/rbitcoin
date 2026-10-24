@@ -5560,3 +5560,25 @@ include!("../regtest_chain_ops_journey.rs");
 
 mod chain;
 mod mempool;
+
+/// Two regtest `generate` calls at once, with a transaction in the pool. Core
+/// assembles and connects each block under cs_main, so neither block can
+/// carry a transaction the other just confirmed (`bad-txns-BIP30`).
+#[test]
+fn concurrent_generate_mines_each_pool_tx_once() {
+    let (ctx, _dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(120)]).unwrap();
+    for height in 1..=20u32 {
+        let keep = generated_coinbase_value(&ctx, height) - 1_000;
+        let (hex, _) =
+            spend_generated_coinbase(&ctx, height, keep, ScriptBuf::from_bytes(vec![0x51]));
+        dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+        std::thread::scope(|s| {
+            let a = s.spawn(|| dispatch(&ctx, "generate", vec![json!(1)]));
+            let b = s.spawn(|| dispatch(&ctx, "generate", vec![json!(1)]));
+            for (name, r) in [("a", a.join().unwrap()), ("b", b.join().unwrap())] {
+                assert!(r.is_ok(), "round {height} generate {name}: {r:?}");
+            }
+        });
+    }
+}
